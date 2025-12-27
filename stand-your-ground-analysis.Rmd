@@ -1,0 +1,361 @@
+---
+title: "Do Stand Your Ground Laws Increase Homicides?"
+subtitle: "A Difference-in-Differences Analysis with Staggered Treatment"
+author: "Pranav Mehta"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+    number_sections: yes
+    highlight: tango
+    theme: default
+    fig_caption: yes
+    df_print: tibble
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+    number_sections: yes
+urlcolor: blue
+header-includes:
+- \usepackage{amsmath}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introduction
+
+In 2022, there were 48,202 gun-related deaths in the United States, with Black individuals more than 2.5 times as likely to die from gun violence, according to [CDC data](https://wisqars.cdc.gov/create-tables/). Seventeen-year-old Trayvon Martin was one such victim—a young Black man killed by an attacker in a gated community in Florida in 2012.
+
+In 2005, Florida passed what has become known as a "Stand Your Ground" law, removing the duty to retreat from an attacker before using deadly force and eliminating civil liability for any death or injury inflicted. Between 2000 and 2010, 21 states passed similar laws. These statutes effectively expand the "castle doctrine" from homes to public spaces, explains the [Brady Campaign](https://www.bradyunited.org/resources/issues/stand-your-ground-laws), allowing a person to legally shoot and kill another person under a "shoot first, ask questions later" model. Critics argue that these laws perpetuate racial disparities in gun violence that disproportionately harm Black Americans.
+
+This project replicates key findings from Cheng and Hoekstra (2013), who evaluated the effects of Stand Your Ground laws on homicides using a difference-in-differences (DID) design with staggered treatment timing. The analysis draws on methods from Scott Cunningham's *Causal Inference: The Mixtape* ([Chapter 9](https://mixtape.scunning.com/09-difference_in_differences)) and Nick Huntington-Klein's *The Effect* ([Chapter 18](https://theeffectbook.net/ch-DifferenceinDifference.html)).
+
+This analysis was completed as part of the *Data Analysis for Policy Research using R* course at Columbia University, taught by Prof. Harold Stolper.
+
+```{r load-libraries}
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(fixest)
+library(ggfixest)
+library(bacondecomp)
+```
+
+# Data
+
+The dataset contains state-year panel data on homicides and demographic/policy variables from 2000–2010.
+
+```{r variable-table, echo=FALSE, message=FALSE, warnings=FALSE, results='asis'}
+tabl <- "
+| Variable | Description |
+|----------|:------------|
+| state | State name |
+| year | Year |
+| evertreated | = 1 if state ever adopted Stand Your Ground law, = 0 otherwise |
+| D | = 1 if Stand Your Ground law in effect, = 0 otherwise |
+| treatment_date | Year Stand Your Ground law was passed (if any) |
+| homicide_c | Homicide count |
+| population | State population |
+| popwt | Mean state population (2000–2010) |
+| blackm_15_24 | % Black males aged 15–24 |
+| whitem_15_24 | % White males aged 15–24 |
+| unemployrt | Unemployment rate |
+| poverty | Poverty rate |
+| l_income | Log median income |
+| l_police | Log police per 100,000 population |
+| l_prisoner | Log incarceration rate per 100,000 |
+"
+cat(tabl)
+```
+
+## Data Preparation
+
+```{r load-data, echo=FALSE}
+load("castle_expanded2.rdata")
+
+data <- data %>%
+  mutate(
+    homicide_rate = (homicide_c / population) * 100000,
+    log_homicide_rate = log(homicide_rate),
+    year = as.integer(year)
+  )
+```
+
+```{r sample-stats}
+n_states <- length(unique(data$state))
+n_years <- length(unique(data$year))
+n_obs <- nrow(data)
+
+cat("Number of states:", n_states, "\n")
+cat("Number of years:", n_years, "\n")
+cat("Total observations:", n_obs, "\n")
+```
+
+The panel includes `r n_states` states observed over `r n_years` years (2000–2010), for a total of `r n_obs` state-year observations.
+
+```{r syg-adopters, echo=FALSE}
+n_syg <- data %>%
+  filter(evertreated == 1) %>%
+  group_by(state) %>%
+  summarize(first_treat_year = min(treatment_date, na.rm = TRUE), .groups = "drop") %>%
+  filter(first_treat_year >= 2000, first_treat_year <= 2010) %>%
+  nrow()
+```
+
+**`r n_syg` states** adopted Stand Your Ground laws between 2000 and 2010.
+
+## Baseline Comparisons
+
+```{r baseline-rates, echo=FALSE}
+weighted_rates_2000 <- data %>%
+  filter(year == 2000) %>%
+  group_by(evertreated) %>%
+  summarise(
+    weighted_homicide_rate = weighted.mean(homicide_rate, popwt, na.rm = TRUE)
+  )
+```
+
+In 2000 (before any treatment), the population-weighted mean homicide rate was `r round(weighted_rates_2000$weighted_homicide_rate[weighted_rates_2000$evertreated==0], 2)` per 100,000 for never-treated states and `r round(weighted_rates_2000$weighted_homicide_rate[weighted_rates_2000$evertreated==1], 2)` per 100,000 for states that would eventually adopt Stand Your Ground laws.
+
+## Distribution of Homicide Rates
+
+```{r histograms, echo=FALSE, fig.show='hold', out.width='50%'}
+ggplot(data %>% filter(year == 2000), aes(x = homicide_rate)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white") +
+  labs(
+    title = "Distribution of Homicide Rate (2000)",
+    x = "Homicide rate (per 100,000)",
+    y = "Number of states"
+  ) +
+  theme_minimal()
+
+ggplot(data %>% filter(year == 2000), aes(x = log_homicide_rate)) +
+  geom_histogram(binwidth = 0.25, fill = "steelblue", color = "white") +
+  labs(
+    title = "Distribution of ln(Homicide Rate) (2000)",
+    x = "ln(Homicide rate)",
+    y = "Number of states"
+  ) +
+  theme_minimal()
+```
+
+The log transformation compresses the right tail, producing a more symmetric distribution better suited for regression analysis.
+
+## Changes in Homicide Rates by State (2000–2010)
+
+```{r change-plot, echo=FALSE, fig.height=10, fig.width=8}
+wide <- data %>% 
+  select(year, sid, state, homicide_rate, evertreated) %>% 
+  pivot_wider(names_from = year, values_from = homicide_rate) %>% 
+  mutate(
+    d_hom_rate = `2010` - `2000`,
+    evertreated = factor(evertreated)
+  ) %>%
+  filter(!is.na(`2000`), !is.na(`2010`))
+
+wide$evertreated <- fct_recode(
+  wide$evertreated,
+  "SYG adopted" = "1",
+  "Never treated" = "0"
+)
+
+wide %>% 
+  mutate(state = fct_reorder(state, d_hom_rate)) %>%
+  ggplot(aes(x = state, y = d_hom_rate, fill = evertreated)) + 
+  geom_col(width = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("SYG adopted" = "#E74C3C", "Never treated" = "#3498DB")
+  ) +
+  labs(
+    title = "Change in Homicide Rate (per 100,000), 2000 to 2010",
+    subtitle = "Bars above zero indicate an increase; below zero a decline",
+    x = NULL,
+    y = "Change in homicide rate (2010 − 2000)",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+# Difference-in-Differences Design
+
+The staggered rollout of Stand Your Ground laws provides a series of natural experiments. I examine event study plots comparing treated states to never-treated states before and after law adoption.
+
+## Case Study: Florida (2005 Adopter)
+
+Florida was the first state to pass a Stand Your Ground law during this period (effective 2005). I compare Florida's homicide rate trajectory to the population-weighted mean of never-treated states.
+
+```{r florida-analysis, echo=FALSE}
+florida_comp <- data %>%
+  filter(state == "Florida" | evertreated == 0)
+
+florida_collapsed <- florida_comp %>%
+  group_by(year, evertreated) %>%
+  summarise(
+    w_mean_ln_homicide_rate = weighted.mean(log_homicide_rate, popwt, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+florida_plotdf <- florida_collapsed %>%
+  mutate(group = factor(
+    evertreated,
+    levels = c(0, 1),
+    labels = c("Never treated (pop-weighted mean)", "Florida")
+  ))
+
+ggplot(florida_plotdf,
+       aes(x = year, y = w_mean_ln_homicide_rate, color = group)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 2004, linetype = "dashed") +
+  scale_x_continuous(breaks = 2000:2010) +
+  scale_color_manual(values = c("#3498DB", "#E74C3C")) +
+  labs(
+    title = "Trends in Log Homicide Rate: Florida vs. Never-Treated States",
+    subtitle = "Vertical line indicates year before treatment (2004)",
+    x = NULL,
+    y = "ln(homicide rate per 100,000)",
+    color = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+*Figure 1. Event study plot for Florida vs. never-treated states.*
+
+The pre-treatment trends from 2000–2004 appear roughly parallel, supporting the identifying assumption. After the law took effect in 2005, Florida's homicide rate diverges upward relative to never-treated states.
+
+## Case Study: 2006 Adopters
+
+Eleven states adopted Stand Your Ground laws in 2006:
+
+```{r syg-2006-states, echo=FALSE}
+syg_2006 <- data %>%
+  filter(!is.na(treatment_date)) %>%
+  group_by(state) %>%
+  summarise(first_treat_year = min(treatment_date), .groups = "drop") %>%
+  filter(first_treat_year == 2006) %>%
+  arrange(state)
+
+kable(syg_2006, col.names = c("State", "Year Adopted"))
+```
+
+```{r syg-2006-plot, echo=FALSE}
+data_2006 <- data %>%
+  filter((!is.na(treatment_date) & treatment_date == 2006) | evertreated == 0)
+
+collapsed_2006 <- data_2006 %>%
+  group_by(year, evertreated) %>%
+  summarise(
+    w_mean_ln_homicide_rate = weighted.mean(log_homicide_rate, popwt, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+plotdf_2006 <- collapsed_2006 %>%
+  mutate(group = factor(
+    evertreated,
+    levels = c(0, 1),
+    labels = c("Never treated (pop-weighted mean)", "2006 adopters")
+  ))
+
+ggplot(plotdf_2006,
+       aes(x = year, y = w_mean_ln_homicide_rate, color = group)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 2005, linetype = "dashed") +
+  scale_x_continuous(breaks = 2000:2010) +
+  scale_color_manual(values = c("#3498DB", "#E74C3C")) +
+  labs(
+    title = "Trends in Log Homicide Rate: 2006 Adopters vs. Never-Treated States",
+    subtitle = "Vertical line indicates year before treatment (2005)",
+    x = NULL,
+    y = "ln(homicide rate per 100,000)",
+    color = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+*Figure 2. Event study plot for 2006 adopters vs. never-treated states.*
+
+The evidence for parallel pre-trends is weaker here—the 2006 adopters' trajectory differs somewhat from never-treated states prior to treatment. This raises concerns about the validity of the DID design for this comparison.
+
+# Two-Way Fixed Effects Estimation
+
+To estimate an average treatment effect across all 21 treated states, I use a two-way fixed effects (TWFE) model:
+
+$$
+Y_{it} = \delta D_{it} + \sigma_{i} + \tau_{t} + \epsilon_{it}
+$$
+
+where $D_{it}$ indicates whether a Stand Your Ground law was in effect in state $i$ at time $t$, $\sigma_i$ are state fixed effects, and $\tau_t$ are year fixed effects.
+
+```{r twfe-estimation}
+twfe_model <- feols(
+  log_homicide_rate ~ D | state + year,
+  data = data,
+  cluster = "state"
+)
+
+summary(twfe_model)
+```
+
+```{r twfe-results, echo=FALSE}
+coef_D <- coef(twfe_model)["D"]
+se_D <- se(twfe_model)["D"]
+```
+
+The estimated coefficient on $D_{it}$ is **`r round(coef_D, 3)`** (SE = `r round(se_D, 3)`), indicating that Stand Your Ground laws are associated with an approximately **`r round(coef_D * 100, 1)`% increase** in homicide rates.
+
+Cheng and Hoekstra (2013) note that this effect amounts to approximately **600 additional homicides per year** in the 21 adopting states.
+
+# Discussion
+
+## Internal Validity
+
+Several concerns merit attention:
+
+1. **Pre-trends**: The event study for 2006 adopters shows some divergence in pre-treatment trends, raising questions about whether the parallel trends assumption holds.
+
+2. **Confounding policies**: States that passed Stand Your Ground laws may have also enacted other criminal justice or gun policy reforms around the same time. If these policies also affected homicide rates, the DID estimate may be biased.
+
+3. **Anticipation effects**: If behavioral changes occurred before the laws took effect (e.g., increased gun purchases in anticipation), this could bias estimates.
+
+## External Validity
+
+Even if internally valid, generalizing these findings requires caution:
+
+- Many adopting states are in the South, where firearm ownership patterns, crime dynamics, and self-defense norms differ from other regions.
+- The estimated effect may not apply to states considering adoption today, given changes in gun culture and policy environments since 2000–2010.
+
+## Robustness
+
+Cheng and Hoekstra (2013) provide several robustness checks, including showing that Stand Your Ground laws are not associated with meaningful changes in other types of crime—addressing concerns that unobserved factors driving general crime trends could explain the results.
+
+# Conclusion
+
+This analysis replicates key findings from Cheng and Hoekstra (2013): Stand Your Ground laws are associated with an 8–10% increase in homicide rates. As Scott Cunningham reflects:
+
+> Thinking back to the killing of Trayvon Martin by George Zimmerman, one is left to wonder whether Trayvon might still be alive had Florida not passed Stand Your Ground. This kind of counterfactual reasoning can drive you crazy, because it is unanswerable... What we do know is that under certain assumptions related to the DD design, homicides were on net around 8%–10% higher than they would've been when compared against explicit counterfactuals. And while that doesn't answer every question, it suggests that a nontrivial number of deaths can be blamed on laws similar to Stand Your Ground.
+
+The staggered adoption of these laws across states provides valuable variation for causal inference, but researchers must carefully assess whether parallel trends assumptions hold for each comparison. The findings contribute to ongoing debates about gun policy and public safety in the United States.
+
+---
+
+## References
+
+Cheng, C., & Hoekstra, M. (2013). Does strengthening self-defense law deter crime or escalate violence? Evidence from expansions to castle doctrine. *Journal of Human Resources*, 48(3), 821-854.
+
+Cunningham, S. (2021). *Causal Inference: The Mixtape*. Yale University Press.
+
+Huntington-Klein, N. (2021). *The Effect: An Introduction to Research Design and Causality*. Chapman and Hall/CRC.
+
+---
+
+*Data source: Cheng & Hoekstra (2013) replication data*
