@@ -1,0 +1,38 @@
+# R files
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+
+# R environment
+.Renviron
+
+# RStudio files
+.Rproj.user/
+*.Rproj
+
+# Data files (not to be shared)
+*.RData
+*.rdata
+*.rda
+*.rds
+*.dta
+*.csv
+
+# Knitted output (optional - uncomment to track)
+# *.html
+# *.pdf
+
+# Temporary files
+*~
+\#*\#
+.\#*
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
